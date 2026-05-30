@@ -1,6 +1,7 @@
 package samln
 
 import (
+	"crypto/ed25519"
 	"crypto/rsa"
 	"encoding/base64"
 	"errors"
@@ -13,7 +14,6 @@ import (
 
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/0TrustCloud/ultimate_db"
-	"github.com/0TrustCloud/service_keys"
 )
 
 type contextKey string
@@ -44,7 +44,7 @@ func New(db *ultimate_db.DB, issuer string, privateKey *rsa.PrivateKey, authPage
 		DB:         db,
 		Mux:        http.NewServeMux(),
 		signingKey: privateKey,
-		keyID:      "samln-v3-hardware-decoupled",
+		keyID:      "samln-v4-noise-decoupled",
 		issuer:     issuer,
 		authPageID: authPageID,
 	}, nil
@@ -73,7 +73,7 @@ func (se *SAMLnEngine) CompileSAMLnString(script string, variables map[string]in
 	samlAttributes := make(map[string]interface{})
 	authnStatement := make(map[string]interface{})
 	subjectConfirmation := make(map[string]interface{})
-	hardwareSig := make(map[string]interface{})
+	noiseSig := make(map[string]interface{})
 	deviceBinding := make(map[string]interface{})
 
 	for _, node := range nodes {
@@ -84,7 +84,7 @@ func (se *SAMLnEngine) CompileSAMLnString(script string, variables map[string]in
 					coreClaims["jti"] = id
 				}
 				coreClaims["saml_issue_instant"] = time.Now().Format(time.RFC3339)
-				se.compileHardwareCoreBlocks(elem.Children, coreClaims, samlAttributes, authnStatement, subjectConfirmation, hardwareSig, deviceBinding)
+				se.compileNoiseCoreBlocks(elem.Children, coreClaims, samlAttributes, authnStatement, subjectConfirmation, noiseSig, deviceBinding)
 			}
 		}
 	}
@@ -92,7 +92,7 @@ func (se *SAMLnEngine) CompileSAMLnString(script string, variables map[string]in
 	if len(samlAttributes) > 0 { coreClaims["saml:AttributeStatement"] = samlAttributes }
 	if len(authnStatement) > 0 { coreClaims["saml:AuthnStatement"] = authnStatement }
 	if len(subjectConfirmation) > 0 { coreClaims["saml:SubjectConfirmation"] = subjectConfirmation }
-	if len(hardwareSig) > 0 { coreClaims["saml:HardwareSignature"] = hardwareSig }
+	if len(noiseSig) > 0 { coreClaims["saml:NoiseSignature"] = noiseSig }
 	if len(deviceBinding) > 0 { coreClaims["saml:DeviceBinding"] = deviceBinding }
 
 	if _, exists := coreClaims["exp"]; !exists {
@@ -105,7 +105,7 @@ func (se *SAMLnEngine) CompileSAMLnString(script string, variables map[string]in
 	return token.SignedString(se.signingKey)
 }
 
-func (se *SAMLnEngine) compileHardwareCoreBlocks(children []Node, claims jwt.MapClaims, attrs, authn, subConf, hwSig, devBind map[string]interface{}) {
+func (se *SAMLnEngine) compileNoiseCoreBlocks(children []Node, claims jwt.MapClaims, attrs, authn, subConf, noiseSig, devBind map[string]interface{}) {
 	for _, child := range children {
 		elem, ok := child.(Element)
 		if !ok { continue }
@@ -115,16 +115,16 @@ func (se *SAMLnEngine) compileHardwareCoreBlocks(children []Node, claims jwt.Map
 			if len(elem.Children) > 0 {
 				claims["sub"] = elem.Children[0].Eval()
 			}
-		case "hardwaresignature":
+		case "noisesignature":
 			if keyType, found := elem.Attributes["keytype"]; found {
-				hwSig["KeyType"] = keyType
+				noiseSig["KeyType"] = keyType
 			}
 			if proof, found := elem.Attributes["proof"]; found {
-				hwSig["Proof"] = proof
+				noiseSig["Proof"] = proof
 			}
 			for _, subChild := range elem.Children {
-				if sc, ok := subChild.(Element); ok && strings.ToLower(sc.Tag) == "tpmpubkey" {
-					hwSig["TPMPublicBytes"] = sc.Children[0].Eval()
+				if sc, ok := subChild.(Element); ok && strings.ToLower(sc.Tag) == "noisepubkey" {
+					noiseSig["NoisePubBytes"] = sc.Children[0].Eval()
 				}
 			}
 		case "devicebinding":
@@ -148,10 +148,10 @@ func (se *SAMLnEngine) compileHardwareCoreBlocks(children []Node, claims jwt.Map
 }
 
 // =============================================================================
-// Decoupled Hardware Verification Path
+// Decoupled Noise Identity Verification Path
 // =============================================================================
 
-func (se *SAMLnEngine) ValidateHardwareAssertion(tokenString string, expectedChallenge string) (bool, error) {
+func (se *SAMLnEngine) ValidateNoiseAssertion(tokenString string, expectedChallenge string) (bool, error) {
 	parsedToken, err := jwt.Parse(tokenString, func(token *jwt.Token) (interface{}, error) {
 		return &se.signingKey.PublicKey, nil
 	})
@@ -165,23 +165,30 @@ func (se *SAMLnEngine) ValidateHardwareAssertion(tokenString string, expectedCha
 	subjectName, _ := claims["sub"].(string)
 	if subjectName == "" { return false, errors.New("assertion missing required subject field identifier") }
 
-	rawHwSig, absoluteHardwarePresent := claims["saml:HardwareSignature"]
+	rawNoiseSig, absoluteNoisePresent := claims["saml:NoiseSignature"]
 	rawDevBind, absoluteDBSCPresent := claims["saml:DeviceBinding"]
 
-	if absoluteHardwarePresent {
-		hwSig := rawHwSig.(map[string]interface{})
-		proofStr, _ := hwSig["Proof"].(string)
+	if absoluteNoisePresent {
+		noiseSig := rawNoiseSig.(map[string]interface{})
+		proofStr, _ := noiseSig["Proof"].(string)
+		pubKeyStr, _ := noiseSig["NoisePubBytes"].(string)
 
 		sigBytes, err := base64.StdEncoding.DecodeString(proofStr)
 		if err != nil { return false, errors.New("failed decoding base64 envelope signature bytes") }
 
-		// Rebuild the verification payload string to match the tracked hash format
+		pubKeyBytes, err := base64.StdEncoding.DecodeString(pubKeyStr)
+		if err != nil { return false, errors.New("failed decoding base64 noise public key bytes") }
+
+		if len(pubKeyBytes) != ed25519.PublicKeySize {
+			return false, errors.New("invalid noise static identity key length")
+		}
+
+		// Rebuild verification payload execution string
 		payload := fmt.Sprintf("%s|%s", claims["jti"].(string), subjectName)
 
-		// FIXED: Call service_keys manager directly to process verification completely
-		skm := service_keys.NewServiceKeyManager(se.DB, nil, nil)
-		if !skm.VerifySignature(subjectName, []byte(payload), sigBytes) {
-			return false, errors.New("TPM service key assertion signature challenge verification failed via service_keys")
+		// Verify signature using the decoupled public identity key directly
+		if !ed25519.Verify(pubKeyBytes, []byte(payload), sigBytes) {
+			return false, errors.New("Noise key assertion signature verification challenge failed")
 		}
 	}
 
