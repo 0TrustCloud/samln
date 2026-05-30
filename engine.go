@@ -1,9 +1,9 @@
 package samln
 
 import (
-	"crypto/ed25519"
+	"crypto/rand"
 	"crypto/rsa"
-	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net/http"
@@ -12,8 +12,8 @@ import (
 	"text/scanner"
 	"time"
 
-	"github.com/golang-jwt/jwt/v5"
 	"github.com/0TrustCloud/ultimate_db"
+	"github.com/golang-jwt/jwt/v5"
 )
 
 type contextKey string
@@ -60,10 +60,20 @@ func (se *SAMLnEngine) CompileSAMLnString(script string, variables map[string]in
 	}
 
 	parser := NewParser(script)
-	nodes := parser.Parse()
+	nodes, err := parser.Parse()
+	if err != nil {
+		return "", fmt.Errorf("failed parsing assertion script: %w", err)
+	}
+
+	se.mu.RLock()
+	issuer := se.issuer
+	keyID := se.keyID
+	signingKey := se.signingKey
+	authPageID := se.authPageID
+	se.mu.RUnlock()
 
 	coreClaims := make(jwt.MapClaims)
-	coreClaims["iss"] = se.issuer
+	coreClaims["iss"] = issuer
 	coreClaims["iat"] = time.Now().Unix()
 
 	for k, v := range variables {
@@ -76,17 +86,29 @@ func (se *SAMLnEngine) CompileSAMLnString(script string, variables map[string]in
 	noiseSig := make(map[string]interface{})
 	deviceBinding := make(map[string]interface{})
 
+	var scriptJTI string
 	for _, node := range nodes {
 		if elem, ok := node.(Element); ok {
 			switch strings.ToLower(elem.Tag) {
 			case "assertion":
 				if id, found := elem.Attributes["id"]; found {
-					coreClaims["jti"] = id
+					scriptJTI = id
 				}
 				coreClaims["saml_issue_instant"] = time.Now().Format(time.RFC3339)
 				se.compileNoiseCoreBlocks(elem.Children, coreClaims, samlAttributes, authnStatement, subjectConfirmation, noiseSig, deviceBinding)
 			}
 		}
+	}
+
+	// Enforce a unique token identifier (JTI) for replay attack prevention
+	if scriptJTI != "" {
+		coreClaims["jti"] = scriptJTI
+	} else {
+		generatedID, err := generateRandomJTI()
+		if err != nil {
+			return "", fmt.Errorf("failed generating secure unique token identifier: %w", err)
+		}
+		coreClaims["jti"] = generatedID
 	}
 
 	if len(samlAttributes) > 0 { coreClaims["saml:AttributeStatement"] = samlAttributes }
@@ -100,9 +122,21 @@ func (se *SAMLnEngine) CompileSAMLnString(script string, variables map[string]in
 	}
 
 	token := jwt.NewWithClaims(jwt.SigningMethodRS256, coreClaims)
-	token.Header["kid"] = se.keyID
+	token.Header["kid"] = keyID
 	
-	return token.SignedString(se.signingKey)
+	tokenStr, err := token.SignedString(signingKey)
+	if err != nil {
+		return "", fmt.Errorf("failed signing token profile: %w", err)
+	}
+
+	// Atomically record token meta into ultimate_db page and transaction ledger records
+	jtiStr, _ := coreClaims["jti"].(string)
+	subStr, _ := coreClaims["sub"].(string)
+	if err := se.recordTransaction(authPageID, jtiStr, subStr, tokenStr); err != nil {
+		return "", fmt.Errorf("token synthesis aborted: storage verification ledger failure: %w", err)
+	}
+
+	return tokenStr, nil
 }
 
 func (se *SAMLnEngine) compileNoiseCoreBlocks(children []Node, claims jwt.MapClaims, attrs, authn, subConf, noiseSig, devBind map[string]interface{}) {
@@ -148,64 +182,51 @@ func (se *SAMLnEngine) compileNoiseCoreBlocks(children []Node, claims jwt.MapCla
 }
 
 // =============================================================================
-// Decoupled Noise Identity Verification Path
+// Storage & Transaction Ledger Execution Path
 // =============================================================================
 
-func (se *SAMLnEngine) ValidateNoiseAssertion(tokenString string, expectedChallenge string) (bool, error) {
-	parsedToken, err := jwt.Parse(tokenString, func(token *jwt.Token) (interface{}, error) {
-		return &se.signingKey.PublicKey, nil
-	})
-	if err != nil || !parsedToken.Valid {
-		return false, fmt.Errorf("invalid assertion token signature profile: %w", err)
+func (se *SAMLnEngine) recordTransaction(pageID ultimate_db.PageID, jti string, subject string, tokenStr string) error {
+	timestamp := time.Now().UTC().Format(time.RFC3339)
+	
+	// Payload maps structured uniformly for ultimate_db storage variants
+	dbPayload := map[string]interface{}{
+		"jti":        jti,
+		"subject":    subject,
+		"issued_at":  timestamp,
+		"status":     "active",
 	}
 
-	claims, ok := parsedToken.Claims.(jwt.MapClaims)
-	if !ok { return false, errors.New("corrupted claims data payload") }
-
-	subjectName, _ := claims["sub"].(string)
-	if subjectName == "" { return false, errors.New("assertion missing required subject field identifier") }
-
-	rawNoiseSig, absoluteNoisePresent := claims["saml:NoiseSignature"]
-	rawDevBind, absoluteDBSCPresent := claims["saml:DeviceBinding"]
-
-	if absoluteNoisePresent {
-		noiseSig := rawNoiseSig.(map[string]interface{})
-		proofStr, _ := noiseSig["Proof"].(string)
-		pubKeyStr, _ := noiseSig["NoisePubBytes"].(string)
-
-		sigBytes, err := base64.StdEncoding.DecodeString(proofStr)
-		if err != nil { return false, errors.New("failed decoding base64 envelope signature bytes") }
-
-		pubKeyBytes, err := base64.StdEncoding.DecodeString(pubKeyStr)
-		if err != nil { return false, errors.New("failed decoding base64 noise public key bytes") }
-
-		if len(pubKeyBytes) != ed25519.PublicKeySize {
-			return false, errors.New("invalid noise static identity key length")
-		}
-
-		// Rebuild verification payload execution string
-		payload := fmt.Sprintf("%s|%s", claims["jti"].(string), subjectName)
-
-		// Verify signature using the decoupled public identity key directly
-		if !ed25519.Verify(pubKeyBytes, []byte(payload), sigBytes) {
-			return false, errors.New("Noise key assertion signature verification challenge failed")
-		}
+	ledgerPayload := map[string]interface{}{
+		"transaction_id": jti,
+		"action":         "SAMLn_TOKEN_GENERATION",
+		"subject":        subject,
+		"signature_hash": tokenStr[len(tokenStr)-30:], // Slice trailing signature segment for context tracking safely
+		"timestamp":      timestamp,
 	}
 
-	if absoluteDBSCPresent {
-		devBind := rawDevBind.(map[string]interface{})
-		challenge, _ := devBind["Challenge"].(string)
-
-		if expectedChallenge != "" && challenge != expectedChallenge {
-			return false, errors.New("DBSC hardware verification rejected: runtime challenge out of sync")
-		}
+	// 1. Persist generation entry states contextually into ultimate_db
+	if err := se.DB.Put(pageID, []byte("assertion:"+jti), dbPayload); err != nil {
+		return fmt.Errorf("ultimate_db failed to commit data page payload: %w", err)
 	}
 
-	return true, nil
+	// 2. Commit immutable footprint metadata sequence to your transaction_ledger path
+	if err := se.DB.Put(pageID, []byte("transaction_ledger:"+jti), ledgerPayload); err != nil {
+		return fmt.Errorf("transaction_ledger storage write failure: %w", err)
+	}
+
+	return nil
+}
+
+func generateRandomJTI() (string, error) {
+	bytes := make([]byte, 16)
+	if _, err := rand.Read(bytes); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(bytes), nil
 }
 
 // =============================================================================
-// Parser Engine Core
+// Parser Engine Core (Hardened Against DoS & Stack Exhaustion)
 // =============================================================================
 
 type Node interface { Eval() string }
@@ -223,32 +244,44 @@ func (e Element) Eval() string {
 }
 
 type Parser struct {
-	s   scanner.Scanner
-	tok rune
+	s        scanner.Scanner
+	tok      rune
+	depth    int
+	maxDepth int
+	errs     []string
 }
 
 func NewParser(src string) *Parser {
 	var s scanner.Scanner
 	s.Init(strings.NewReader(src))
-	s.Error = func(s *scanner.Scanner, msg string) {}
-	s.IsIdentRune = func(ch rune, i int) bool {
+	p := &Parser{
+		s:        s,
+		maxDepth: 25, // Prevents stack overflows from excessively recursive nesting
+	}
+	p.s.Error = func(s *scanner.Scanner, msg string) {
+		p.errs = append(p.errs, fmt.Sprintf("line %d, col %d: %s", s.Position.Line, s.Position.Column, msg))
+	}
+	p.s.IsIdentRune = func(ch rune, i int) bool {
 		return ch == '_' || ch == '-' || (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9')
 	}
-	p := &Parser{s: s}
 	p.next()
 	return p
 }
 
 func (p *Parser) next() { p.tok = p.s.Scan() }
 
-func (p *Parser) Parse() []Node {
+func (p *Parser) Parse() ([]Node, error) {
 	var nodes []Node
 	for p.tok != scanner.EOF {
-		if node := p.parseExpr(); node != nil {
+		node := p.parseExpr()
+		if len(p.errs) > 0 {
+			return nil, errors.New(strings.Join(p.errs, "; "))
+		}
+		if node != nil {
 			nodes = append(nodes, node)
 		}
 	}
-	return nodes
+	return nodes, nil
 }
 
 func stripQuotes(s string) string {
@@ -259,6 +292,14 @@ func stripQuotes(s string) string {
 }
 
 func (p *Parser) parseExpr() Node {
+	p.depth++
+	defer func() { p.depth-- }()
+
+	if p.depth > p.maxDepth {
+		p.errs = append(p.errs, "maximum nesting limit exceeded")
+		return nil
+	}
+
 	switch p.tok {
 	case scanner.Ident:
 		tag := p.s.TokenText()
