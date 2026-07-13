@@ -88,6 +88,8 @@ func TestSAMLn_HardwareAssertionValidation(t *testing.T) {
 		"id":          tpmEncodedBytes,
 		"name":        subject,
 		"displayName": "Service Node East",
+		"modulus":     base64.StdEncoding.EncodeToString(tpmSimKey.N.Bytes()),
+		"exponent":    tpmSimKey.E,
 	}
 	userBytes, _ := json.Marshal(mockUserPayload)
 

@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -149,7 +150,7 @@ func (se *SAMLnEngine) compileNoiseCoreBlocks(children []Node, claims jwt.MapCla
 			if len(elem.Children) > 0 {
 				claims["sub"] = elem.Children[0].Eval()
 			}
-		case "noisesignature":
+		case "noisesignature", "hardwaresignature":
 			if keyType, found := elem.Attributes["keytype"]; found {
 				noiseSig["KeyType"] = keyType
 			}
@@ -204,15 +205,23 @@ func (se *SAMLnEngine) recordTransaction(pageID ultimate_db.PageID, jti string, 
 		"timestamp":      timestamp,
 	}
 
-	// 1. Persist generation entry states contextually into ultimate_db
-	if err := se.DB.Put(pageID, []byte("assertion:"+jti), dbPayload); err != nil {
-		return fmt.Errorf("ultimate_db failed to commit data page payload: %w", err)
+	assertionBytes, err := json.Marshal(dbPayload)
+	if err != nil {
+		return fmt.Errorf("failed to marshal assertion payload: %w", err)
+	}
+	ledgerBytes, err := json.Marshal(ledgerPayload)
+	if err != nil {
+		return fmt.Errorf("failed to marshal ledger payload: %w", err)
 	}
 
-	// 2. Commit immutable footprint metadata sequence to your transaction_ledger path
-	if err := se.DB.Put(pageID, []byte("transaction_ledger:"+jti), ledgerPayload); err != nil {
+	txn := se.DB.BeginTxn()
+	if err := se.DB.Write(pageID, txn, []byte("assertion:"+jti), assertionBytes, ""); err != nil {
+		return fmt.Errorf("ultimate_db failed to commit data page payload: %w", err)
+	}
+	if err := se.DB.Write(pageID, txn, []byte("transaction_ledger:"+jti), ledgerBytes, ""); err != nil {
 		return fmt.Errorf("transaction_ledger storage write failure: %w", err)
 	}
+	se.DB.CommitTxn(txn)
 
 	return nil
 }
