@@ -1,4 +1,4 @@
-github.com/0TrustCloud/ultimate_db v1.3.5 h1:ndQNcm6N2xRb9NV1i0s3C40/tedw8KZ9iDYMghClZkI=
-github.com/0TrustCloud/ultimate_db v1.3.5/go.mod h1:EyJfczi4rKEiYRZVLD8IZfR4bRtXPGNW4pGS7tyP7R8=
+github.com/0TrustCloud/ultimate_db v1.3.6 h1:XIXGy4zxtsfSH0u3up+2p6hsuFDyiL3C5/ky0IzNJ/M=
+github.com/0TrustCloud/ultimate_db v1.3.6/go.mod h1:zts/iJNVBJeAeIurLSuN+RYLS1Rc5d1qWRV0g8YD420=
 github.com/golang-jwt/jwt/v5 v5.3.1 h1:kYf81DTWFe7t+1VvL7eS+jKFVWaUnK9cB1qbwn63YCY=
 github.com/golang-jwt/jwt/v5 v5.3.1/go.mod h1:fxCRLWMO43lRc8nhHWY6LGqRcf+1gQWArsqaEUEa5bE=
